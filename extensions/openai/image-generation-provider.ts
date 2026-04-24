@@ -47,6 +47,8 @@ const MAX_CODEX_IMAGE_SSE_BYTES = 64 * 1024 * 1024;
 const MAX_CODEX_IMAGE_SSE_EVENTS = 512;
 const MAX_CODEX_IMAGE_BASE64_CHARS = 64 * 1024 * 1024;
 const LOG_VALUE_MAX_CHARS = 256;
+const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
+const OPENAI_CODEX_JWT_CLAIM_PATH = "https://api.openai.com/auth";
 const MOCK_OPENAI_PROVIDER_ID = "mock-openai";
 const OPENAI_OUTPUT_FORMATS = ["png", "jpeg", "webp"] as const;
 const OPENAI_QUALITIES = ["low", "medium", "high", "auto"] as const;
@@ -266,7 +268,25 @@ function hasCodexOAuthProfileConfigured(req: {
   agentDir?: string;
 }): boolean {
   const store = resolveRequestAuthStore(req);
-  return Boolean(store && listProfilesForProvider(store, "openai-codex").length > 0);
+  return Boolean(store && listProfilesForProvider(store, OPENAI_CODEX_PROVIDER_ID).length > 0);
+}
+
+function resolveOpenAICodexAccountId(token: string): string | undefined {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) {
+      return undefined;
+    }
+    const normalized = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const payload = JSON.parse(Buffer.from(padded, "base64").toString("utf8")) as {
+      [OPENAI_CODEX_JWT_CLAIM_PATH]?: { chatgpt_account_id?: unknown };
+    };
+    const accountId = payload[OPENAI_CODEX_JWT_CLAIM_PATH]?.chatgpt_account_id;
+    return typeof accountId === "string" && accountId.trim() ? accountId.trim() : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 type OpenAIImageApiResponse = {
@@ -525,6 +545,32 @@ function logCodexImageAuthSelected(params: {
   );
 }
 
+function buildOpenAICodexImageGenerationCapabilities(): ImageGenerationProvider["capabilities"] {
+  return {
+    generate: {
+      maxCount: OPENAI_MAX_IMAGE_RESULTS,
+      supportsSize: true,
+      supportsAspectRatio: false,
+      supportsResolution: false,
+    },
+    edit: {
+      enabled: true,
+      maxCount: OPENAI_MAX_IMAGE_RESULTS,
+      maxInputImages: OPENAI_MAX_INPUT_IMAGES,
+      supportsSize: true,
+      supportsAspectRatio: false,
+      supportsResolution: false,
+    },
+    geometry: {
+      sizes: [...OPENAI_SUPPORTED_SIZES],
+    },
+    output: {
+      formats: [...OPENAI_OUTPUT_FORMATS],
+      qualities: [...OPENAI_QUALITIES],
+    },
+  };
+}
+
 async function generateOpenAICodexImage(params: {
   req: Parameters<ImageGenerationProvider["generateImage"]>[0];
   apiKey: string;
@@ -546,6 +592,10 @@ async function generateOpenAICodexImage(params: {
       capability: "image",
       transport: "http",
     });
+  const accountId = resolveOpenAICodexAccountId(apiKey);
+  if (accountId) {
+    headers.set("chatgpt-account-id", accountId);
+  }
 
   const model = req.model || DEFAULT_OPENAI_IMAGE_MODEL;
   const count = resolveOpenAIImageCount(req.count);
@@ -622,6 +672,35 @@ async function generateOpenAICodexImage(params: {
     model,
     metadata: {
       responses: results.map((result) => result.metadata).filter(Boolean),
+    },
+  };
+}
+
+export function buildOpenAICodexImageGenerationProvider(): ImageGenerationProvider {
+  return {
+    id: OPENAI_CODEX_PROVIDER_ID,
+    label: "OpenAI Codex",
+    defaultModel: DEFAULT_OPENAI_IMAGE_MODEL,
+    models: [DEFAULT_OPENAI_IMAGE_MODEL],
+    isConfigured: ({ agentDir }) =>
+      isProviderApiKeyConfigured({
+        provider: OPENAI_CODEX_PROVIDER_ID,
+        agentDir,
+      }),
+    capabilities: buildOpenAICodexImageGenerationCapabilities(),
+    async generateImage(req) {
+      const auth = await resolveApiKeyForProvider({
+        provider: OPENAI_CODEX_PROVIDER_ID,
+        cfg: req.cfg,
+        agentDir: req.agentDir,
+        store: req.authStore,
+      });
+      if (!auth.apiKey) {
+        throw new Error("OpenAI Codex OAuth missing");
+      }
+      const timeoutMs = resolveOpenAIImageTimeoutMs(req.timeoutMs);
+      logCodexImageAuthSelected({ req, authMode: auth.mode, timeoutMs });
+      return generateOpenAICodexImage({ req, apiKey: auth.apiKey });
     },
   };
 }

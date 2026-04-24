@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildOpenAIImageGenerationProvider } from "./image-generation-provider.js";
+import {
+  buildOpenAICodexImageGenerationProvider,
+  buildOpenAIImageGenerationProvider,
+} from "./image-generation-provider.js";
 
 const {
   ensureAuthProfileStoreMock,
@@ -157,6 +160,12 @@ function mockCodexAuthOnly() {
   });
 }
 
+function createFakeJwt(payload: Record<string, unknown>): string {
+  const encode = (value: unknown) =>
+    Buffer.from(JSON.stringify(value)).toString("base64url").replace(/=+$/u, "");
+  return `${encode({ alg: "none" })}.${encode(payload)}.signature`;
+}
+
 function createCodexOAuthAuthStore() {
   return {
     version: 1 as const,
@@ -202,6 +211,80 @@ describe("openai image generation provider", () => {
       formats: ["png", "jpeg", "webp"],
       qualities: ["low", "medium", "high", "auto"],
     });
+  });
+
+  it("advertises OpenAI Codex as a standalone image generation provider", () => {
+    const provider = buildOpenAICodexImageGenerationProvider();
+
+    expect(provider.id).toBe("openai-codex");
+    expect(provider.defaultModel).toBe("gpt-image-2");
+    expect(provider.models).toEqual(["gpt-image-2"]);
+    expect(provider.capabilities.edit.enabled).toBe(true);
+    expect(provider.capabilities.output).toEqual({
+      formats: ["png", "jpeg", "webp"],
+      qualities: ["low", "medium", "high", "auto"],
+    });
+  });
+
+  it("reports standalone Codex image generation configured from Codex auth", () => {
+    const provider = buildOpenAICodexImageGenerationProvider();
+
+    isProviderApiKeyConfiguredMock.mockImplementation((params?: { provider?: string }) => {
+      return params?.provider === "openai-codex";
+    });
+
+    expect(provider.isConfigured?.({ agentDir: "/tmp/agent" })).toBe(true);
+    expect(isProviderApiKeyConfiguredMock).toHaveBeenCalledWith({
+      provider: "openai-codex",
+      agentDir: "/tmp/agent",
+    });
+  });
+
+  it("generates images through the standalone Codex image provider", async () => {
+    const provider = buildOpenAICodexImageGenerationProvider();
+    const token = createFakeJwt({
+      "https://api.openai.com/auth": {
+        chatgpt_account_id: "account-123",
+      },
+    });
+    resolveApiKeyForProviderMock.mockResolvedValue({
+      apiKey: token,
+      source: "profile:openai-codex:default",
+      mode: "oauth",
+    });
+    mockCodexImageStream({ imageData: "standalone-codex-image" });
+
+    const result = await provider.generateImage({
+      provider: "openai-codex",
+      model: "gpt-image-2",
+      prompt: "Draw a standalone Codex image",
+      cfg: {},
+      agentDir: "/tmp/agent",
+      size: "1024x1536",
+    });
+
+    expect(resolveApiKeyForProviderMock).toHaveBeenCalledWith({
+      provider: "openai-codex",
+      cfg: {},
+      agentDir: "/tmp/agent",
+      store: undefined,
+    });
+    expect(postJsonRequestMock).toHaveBeenCalledTimes(1);
+    const request = postJsonRequestMock.mock.calls[0]?.[0];
+    expect(request.url).toBe("https://chatgpt.com/backend-api/codex/responses");
+    expect(request.headers.get("chatgpt-account-id")).toBe("account-123");
+    expect(request.body).toMatchObject({
+      model: "gpt-5.4",
+      tools: [
+        expect.objectContaining({
+          type: "image_generation",
+          model: "gpt-image-2",
+          size: "1024x1536",
+        }),
+      ],
+      tool_choice: { type: "image_generation" },
+    });
+    expect(result.images[0]?.buffer).toEqual(Buffer.from("standalone-codex-image"));
   });
 
   it("reports configured when either OpenAI API key auth or Codex OAuth auth is available", () => {
